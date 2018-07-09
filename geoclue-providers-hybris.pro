@@ -7,10 +7,12 @@ target.path = /usr/libexec
 
 QT = core dbus network
 
+INCLUDEPATH += /usr/include/droidgnss/
+
 CONFIG += link_pkgconfig
 PKGCONFIG += libhardware android-headers connman-qt5 qofono-qt5 qofonoext systemsettings
 
-LIBS += -lrt
+LIBS += -lrt -lhybris-common -lhardware
 
 dbus_geoclue.files = \
     org.freedesktop.Geoclue.xml \
@@ -41,6 +43,7 @@ HEADERS += \
     locationtypes.h
 
 SOURCES += \
+    /usr/share/droidgnss/hybris.cpp \
     main.cpp \
     hybrisprovider.cpp
 

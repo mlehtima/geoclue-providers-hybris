@@ -21,14 +21,20 @@
 #include <QtNetwork/QNetworkReply>
 
 #include <android-version.h>
+#if ANDROID_VERSION_MAJOR >= 8
+#include <droidgnss/droidgnss.h>
+#else
 #include <hardware/gps.h>
+#endif
 
 #include <locationsettings.h>
 
 #include "locationtypes.h"
 
 // Define versions of the Android GPS interface supported.
-#if ANDROID_VERSION_MAJOR >= 7
+#if ANDROID_VERSION_MAJOR >= 8
+    #define GEOCLUE_ANDROID_GPS_INTERFACE 4
+#elif ANDROID_VERSION_MAJOR >= 7
     #define GEOCLUE_ANDROID_GPS_INTERFACE 3
 #elif ANDROID_VERSION_MAJOR >= 5
     #define GEOCLUE_ANDROID_GPS_INTERFACE 2
@@ -178,6 +184,16 @@ private:
     void processConnectionContexts();
     void processNextConnectionContext();
 
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+    DroidGnss *m_gps;
+
+    DroidAGnss *m_agps;
+    DroidAGnssRil *m_agpsril;
+    DroidGnssNi *m_gpsni;
+    DroidGnssXtra *m_xtra;
+
+    DroidGnssDebug *m_debug;
+#else
     gps_device_t *m_gpsDevice;
 
     const GpsInterface *m_gps;
@@ -188,6 +204,7 @@ private:
     const GpsXtraInterface *m_xtra;
 
     const GpsDebugInterface *m_debug;
+#endif
 
     Location m_currentLocation;
 

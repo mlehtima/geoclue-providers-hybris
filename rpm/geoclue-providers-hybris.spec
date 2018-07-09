@@ -15,8 +15,9 @@ BuildRequires: pkgconfig(connman-qt5) >= 1.0.68
 BuildRequires: pkgconfig(qofono-qt5)
 BuildRequires: pkgconfig(qofonoext)
 BuildRequires: pkgconfig(systemsettings)
+BuildRequires: droidgnss-devel
 Requires: connectionagent-qt5 >= 0.9.20
-
+Requires: droidgnss
 %description
 %{summary}.
 

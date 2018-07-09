@@ -76,6 +76,268 @@ const QString LocationSettingsOldAgpsAgreementAcceptedKey = QStringLiteral("loca
 const int MaxXtraServers = 3;
 const QString XtraConfigFile = QStringLiteral("/etc/gps_xtra.ini");
 
+// HIDL GNSS API callbacks
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+
+void locationCallback(const DroidGnssLocation &location)
+{
+    Location loc;
+
+    loc.setTimestamp(location.timestamp);
+
+    if (location.gnssLocationFlags & GNSS_LOCATION_HAS_LAT_LONG) {
+        loc.setLatitude(location.latitudeDegrees);
+        loc.setLongitude(location.longitudeDegrees);
+    }
+
+    if (location.gnssLocationFlags & GNSS_LOCATION_HAS_ALTITUDE)
+        loc.setAltitude(location.altitudeMeters);
+
+    if (location.gnssLocationFlags & GNSS_LOCATION_HAS_SPEED)
+        loc.setSpeed(location.speedMetersPerSec / KnotsToMps);
+
+    if (location.gnssLocationFlags & GNSS_LOCATION_HAS_BEARING)
+        loc.setDirection(location.bearingDegrees);
+
+    if (location.gnssLocationFlags & GNSS_LOCATION_HAS_HORIZONTAL_ACCURACY ||
+        location.gnssLocationFlags & GNSS_LOCATION_HAS_VERTICAL_ACCURACY) {
+        Accuracy accuracy;
+        accuracy.setHorizontal(0);
+        accuracy.setVertical(0);
+        if (location.gnssLocationFlags & GNSS_LOCATION_HAS_HORIZONTAL_ACCURACY)
+            accuracy.setHorizontal(location.horizontalAccuracyMeters);
+        if (location.gnssLocationFlags & GNSS_LOCATION_HAS_VERTICAL_ACCURACY)
+            accuracy.setVertical(location.verticalAccuracyMeters);
+        loc.setAccuracy(accuracy);
+    }
+
+    QMetaObject::invokeMethod(staticProvider, "setLocation", Qt::QueuedConnection,
+                              Q_ARG(Location, loc));
+}
+
+void statusCallback(DroidGnssStatusValue status)
+{
+    switch (status) {
+    case GNSS_STATUS_ENGINE_ON:
+        QMetaObject::invokeMethod(staticProvider, "engineOn", Qt::QueuedConnection);
+        break;
+    case GNSS_STATUS_ENGINE_OFF:
+        QMetaObject::invokeMethod(staticProvider, "engineOff", Qt::QueuedConnection);
+        break;
+    default:
+        ;
+    }
+}
+
+void gnssSvStatusCallback(const DroidGnssSvStatus &svStatus)
+{
+    QList<SatelliteInfo> satellites;
+    QList<int> usedPrns;
+
+    for (unsigned int i = 0; i < svStatus.numSvs; ++i) {
+        SatelliteInfo satInfo;
+        const DroidGnssSvInfo &svInfo = svStatus.gnssSvList[i];
+        satInfo.setPrn(svInfo.svid);
+        satInfo.setSnr(svInfo.cN0Dbhz);
+        satInfo.setElevation(svInfo.elevationDegrees);
+        satInfo.setAzimuth(svInfo.azimuthDegrees);
+        satellites.append(satInfo);
+
+        if (svInfo.svFlag & GNSS_SV_FLAGS_USED_IN_FIX)
+            usedPrns.append(svInfo.svid);
+    }
+
+    QMetaObject::invokeMethod(staticProvider, "setSatellite", Qt::QueuedConnection,
+                              Q_ARG(QList<SatelliteInfo>, satellites),
+                              Q_ARG(QList<int>, usedPrns));
+}
+
+bool nmeaChecksumValid(const QByteArray &nmea)
+{
+    unsigned char checksum = 0;
+    for (int i = 1; i < nmea.length(); ++i) {
+        if (nmea.at(i) == '*') {
+            if (nmea.length() < i+3)
+                return false;
+
+            checksum ^= nmea.mid(i+1, 2).toInt(0, 16);
+
+            break;
+        }
+
+        checksum ^= nmea.at(i);
+    }
+
+    return checksum == 0;
+}
+
+void parseRmc(const QByteArray &nmea)
+{
+    QList<QByteArray> fields = nmea.split(',');
+    if (fields.count() < 12)
+        return;
+
+    bool ok;
+    double variation = fields.at(10).toDouble(&ok);
+    if (ok) {
+        if (fields.at(11) == "W")
+            variation = -variation;
+
+        QMetaObject::invokeMethod(staticProvider, "setMagneticVariation", Qt::QueuedConnection,
+                                  Q_ARG(double, variation));
+    }
+}
+
+void nmeaCallback(DroidGnssUtcTime timestamp, const char *nmeaData, int length)
+{
+    // Trim trailing whitepsace
+    while (length > 0 && isspace(nmeaData[length-1]))
+        --length;
+
+    if (length == 0)
+        return;
+
+    QByteArray nmea = QByteArray::fromRawData(nmeaData, length);
+
+    qCDebug(lcGeoclueHybrisNmea) << timestamp << nmea;
+
+    if (!nmeaChecksumValid(nmea))
+        return;
+
+    // truncate checksum and * from end of sentence
+    nmea.truncate(nmea.length()-3);
+
+    if (nmea.startsWith("$GPRMC"))
+        parseRmc(nmea);
+}
+
+void setCapabilitiesCallback(uint32_t capabilities)
+{
+    qCDebug(lcGeoclueHybris) << "capabilities" << showbase << hex << capabilities;
+}
+
+void acquireWakelockCallback()
+{
+}
+
+void releaseWakelockCallback()
+{
+}
+
+void requestUtcTimeCallback()
+{
+    qCDebug(lcGeoclueHybris);
+
+    QMetaObject::invokeMethod(staticProvider, "injectUtcTime", Qt::QueuedConnection);
+}
+
+void setSystemInfoCallback(const DroidGnssSystemInfo &info)
+{
+    Q_UNUSED(info)
+    qCDebug(lcGeoclueHybris);
+}
+
+void agnssStatusIpV4Callback(const DroidAGnssStatusIpV4 &status)
+{
+    QHostAddress ipv4;
+    QHostAddress ipv6;
+    QByteArray ssid;
+    QByteArray password;
+
+    ipv4.setAddress(status.ipV4Addr);
+
+    QMetaObject::invokeMethod(staticProvider, "agpsStatus", Qt::QueuedConnection,
+                              Q_ARG(qint16, (int16_t)(uint8_t)status.type), Q_ARG(quint16, (uint16_t)(uint8_t)status.status),
+                              Q_ARG(QHostAddress, ipv4), Q_ARG(QHostAddress, ipv6),
+                              Q_ARG(QByteArray, ssid), Q_ARG(QByteArray, password));
+}
+
+void agnssStatusIpV6Callback(const DroidAGnssStatusIpV6 &status)
+{
+    QHostAddress ipv4;
+    QHostAddress ipv6;
+    QByteArray ssid;
+    QByteArray password;
+
+    qDebug() << "IPv6 address extraction is untested";
+/*
+    ipv6.setAddress(reinterpret_cast<sockaddr *>(&status.ipV6Addr));
+*/
+    QMetaObject::invokeMethod(staticProvider, "agpsStatus", Qt::QueuedConnection,
+                              Q_ARG(qint16, (int16_t)(uint8_t)status.type), Q_ARG(quint16, (int16_t)(uint8_t)status.status),
+                              Q_ARG(QHostAddress, ipv4), Q_ARG(QHostAddress, ipv6),
+                              Q_ARG(QByteArray, ssid), Q_ARG(QByteArray, password));
+}
+
+void gnssNiNotifyCallback(const DroidGnssNiNotification &notification)
+{
+    Q_UNUSED(notification)
+    qCDebug(lcGeoclueHybris);
+}
+
+void agnssRilRequestSetId(uint32_t flags)
+{
+    Q_UNUSED(flags)
+    qCDebug(lcGeoclueHybris) << "flags" << showbase << hex << flags;
+}
+
+void agnssRilRequestRefLoc()
+{
+    qCDebug(lcGeoclueHybris);
+}
+
+void gnssXtraDownloadRequest()
+{
+    QMetaObject::invokeMethod(staticProvider, "xtraDownloadRequest", Qt::QueuedConnection);
+}
+
+DroidApnIpType fromContextProtocol(const QString &protocol)
+{
+    if (protocol == QLatin1String("ip"))
+        return APN_IP_IPV4;
+    else if (protocol == QLatin1String("ipv6"))
+        return APN_IP_IPV6;
+    else if (protocol == QLatin1String("dual"))
+        return APN_IP_IPV4V6;
+    else
+        return APN_IP_INVALID;
+}
+
+}
+
+DroidGnssCallback gnssCallbacks = {
+    locationCallback,
+    statusCallback,
+    gnssSvStatusCallback,
+    nmeaCallback,
+    setCapabilitiesCallback,
+    acquireWakelockCallback,
+    releaseWakelockCallback,
+    requestUtcTimeCallback,
+    setSystemInfoCallback
+};
+
+DroidAGnssCallback agnssCallbacks = {
+    agnssStatusIpV4Callback,
+    agnssStatusIpV6Callback
+};
+
+DroidGnssNiCallback gnssNiCallbacks = {
+    gnssNiNotifyCallback
+};
+
+DroidAGnssRilCallback agnssRilCallbacks = {
+    agnssRilRequestSetId,
+    agnssRilRequestRefLoc
+};
+
+DroidGnssXtraCallback gnssXtraCallbacks = {
+    gnssXtraDownloadRequest
+};
+
+
+#else // Legacy callbacks
+
 void locationCallback(GpsLocation *location)
 {
     Location loc;
@@ -392,7 +654,11 @@ GpsCallbacks gpsCallbacks = {
 
 AGpsCallbacks agpsCallbacks = {
     agpsStatusCallback,
+#if GEOCLUE_ANDROID_GPS_INTERFACE <= 3
     createThreadCallback
+#else
+    agpsStatusV4Callback,
+#endif
 };
 
 GpsNiCallbacks gpsNiCallbacks = {
@@ -416,7 +682,7 @@ struct GpsXtraCallbacksWrapper {
     { gpsXtraDownloadRequest, createThreadCallback },
     0
 };
-
+#endif // Legacy callbacks
 
 QDBusArgument &operator<<(QDBusArgument &argument, const Accuracy &accuracy)
 {
@@ -593,6 +859,53 @@ HybrisProvider::HybrisProvider(QObject *parent)
         }
     }
 
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+    droid_gnss_init();
+    m_gps = droid_gnss_get_hal();
+    if (!m_gps) {
+        m_status = StatusError;
+        return;
+    }
+
+    qWarning("Initialising GNSS interface\n");
+    qWarning("DroidGnssSetCallback %p\n", &m_gps->setCallback);
+    bool error = m_gps->setCallback(&gnssCallbacks);
+    if (!error) {
+        qWarning("Failed to initialise GNSS interface, error %d\n", error);
+        m_status = StatusError;
+        return;
+    }
+    qWarning("Initialized GNSS interface\n");
+
+    m_agps = static_cast<DroidAGnss *>(m_gps->getExtensionAGnss());
+    if (m_agps) {
+        qWarning("Initialising AGNSS Interface\n");
+        m_agps->setCallback(&agnssCallbacks);
+    }
+
+    m_gpsni = static_cast<DroidGnssNi *>(m_gps->getExtensionGnssNi());
+    if (m_gpsni) {
+        qWarning("Initialising GNSS NI Interface\n");
+        m_gpsni->setCallback(&gnssNiCallbacks);
+    }
+
+    m_agpsril = static_cast<DroidAGnssRil *>(m_gps->getExtensionAGnssRil());
+    if (m_agpsril) {
+        qWarning("Initialising AGNSS RIL Interface\n");
+        m_agpsril->setCallback(&agnssRilCallbacks);
+    }
+
+    m_xtra = static_cast<DroidGnssXtra *>(m_gps->getExtensionXtra());
+    if (m_xtra) {
+        qWarning("Initialising GNSS Xtra Interface\n");
+        error = m_xtra->setCallback(&gnssXtraCallbacks);
+        if (!error)
+            qWarning("GNSS Xtra Interface init failed, error %d\n", error);
+    }
+
+    m_debug = static_cast<DroidGnssDebug *>(m_gps->getExtensionGnssDebug());
+    qWarning("Initialized GNSS interfaces\n");
+#else
     const hw_module_t *hwModule;
 
     int error = hw_get_module(GPS_HARDWARE_MODULE_ID, &hwModule);
@@ -652,6 +965,7 @@ HybrisProvider::HybrisProvider(QObject *parent)
     }
 
     m_debug = static_cast<const GpsDebugInterface *>(m_gps->get_extension(GPS_DEBUG_INTERFACE));
+#endif
 }
 
 HybrisProvider::~HybrisProvider()
@@ -659,11 +973,14 @@ HybrisProvider::~HybrisProvider()
     if (m_gps)
         m_gps->cleanup();
 
+#if GEOCLUE_ANDROID_GPS_INTERFACE < 4
     if (m_gpsDevice->common.close)
         m_gpsDevice->common.close(reinterpret_cast<hw_device_t *>(m_gpsDevice));
+#endif
 
     if (staticProvider == this)
         staticProvider = 0;
+    droid_gnss_deinit();
 }
 
 void HybrisProvider::setLocationSettings(LocationSettings *settings)
@@ -753,6 +1070,15 @@ void HybrisProvider::SetOptions(const QVariantMap &options)
 
         quint32 updateInterval = minimumRequestedUpdateInterval();
 
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        bool error = m_gps->setPositionMode(m_agpsEnabled ? GNSS_POSITION_MODE_MS_BASED
+                                                          : GNSS_POSITION_MODE_STANDALONE,
+                                            GNSS_POSITION_RECURRENCE_PERIODIC, updateInterval,
+                                            PreferredAccuracy, PreferredInitialFixTime);
+        if (!error) {
+            qWarning("While updating the updateInterval, failed to set position mode, error %d\n", error);
+        }
+#else
         int error = m_gps->set_position_mode(m_agpsEnabled ? GPS_POSITION_MODE_MS_BASED
                                                            : GPS_POSITION_MODE_STANDALONE,
                                              GPS_POSITION_RECURRENCE_PERIODIC, updateInterval,
@@ -760,6 +1086,7 @@ void HybrisProvider::SetOptions(const QVariantMap &options)
         if (error) {
             qWarning("While updating the updateInterval, failed to set position mode, error %d\n", error);
         }
+#endif
     }
 }
 
@@ -911,7 +1238,11 @@ void HybrisProvider::injectPosition(int fields, int timestamp, double latitude, 
     qCDebug(lcGeoclueHybris) << fields << timestamp << latitude << longitude << altitude
                              << accuracy.horizontal() << accuracy.vertical();
 
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+    m_gps->injectLocation(latitude, longitude, accuracy.horizontal());
+#else
     m_gps->inject_location(latitude, longitude, accuracy.horizontal());
+#endif
 }
 
 void HybrisProvider::injectUtcTime()
@@ -1043,7 +1374,11 @@ void HybrisProvider::handleNtpResponse()
 
         qCDebug(lcGeoclueHybris) << "Injecting time" << time << reference << certainty;
 
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        m_gps->injectTime(time, reference, certainty);
+#else
         m_gps->inject_time(time, reference, certainty);
+#endif
 
         m_ntpRetryTimer.stop();
     }
@@ -1100,7 +1435,11 @@ void HybrisProvider::xtraDownloadFinished()
         xtraDownloadRequestSendNext();
     } else {
         QByteArray xtraData = m_xtraDownloadReply->readAll();
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        m_xtra->injectXtraData(xtraData.data());
+#else
         m_xtra->inject_xtra_data(xtraData.data(), xtraData.length());
+#endif
 
         qCDebug(lcGeoclueHybris) << "injected " << xtraData.length() << " bytes of xtra data";
 
@@ -1122,7 +1461,9 @@ void HybrisProvider::agpsStatus(qint16 type, quint16 status, const QHostAddress 
     qCDebug(lcGeoclueHybris) << "type:" << type << "status:" << status;
 
     if (!m_agpsEnabled) {
-#if GEOCLUE_ANDROID_GPS_INTERFACE >= 1
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        m_agps->dataConnFailed();
+#elif GEOCLUE_ANDROID_GPS_INTERFACE >= 1
         m_agps->data_conn_failed();
 #else
         m_agps->data_conn_failed(AGPS_TYPE_SUPL);
@@ -1130,11 +1471,34 @@ void HybrisProvider::agpsStatus(qint16 type, quint16 status, const QHostAddress 
         return;
     }
 
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+    if (type != AGNSS_TYPE_SUPL) {
+#else
     if (type != AGPS_TYPE_SUPL) {
+#endif
         qWarning("Only SUPL AGPS is supported.");
         return;
     }
 
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+    switch (status) {
+    case GNSS_REQUEST_AGNSS_DATA_CONN:
+        startDataConnection();
+        break;
+    case GNSS_RELEASE_AGNSS_DATA_CONN:
+        m_agps->dataConnClosed();
+        stopDataConnection();
+        break;
+    case GNSS_AGNSS_DATA_CONNECTED:
+        break;
+    case GNSS_AGNSS_DATA_CONN_DONE:
+        break;
+    case GNSS_AGNSS_DATA_CONN_FAILED:
+        break;
+    default:
+        qWarning("Unknown AGPS Status.");
+    }
+#else
     switch (status) {
     case GPS_REQUEST_AGPS_DATA_CONN:
         startDataConnection();
@@ -1157,6 +1521,7 @@ void HybrisProvider::agpsStatus(qint16 type, quint16 status, const QHostAddress 
     default:
         qWarning("Unknown AGPS Status.");
     }
+#endif
 }
 
 void HybrisProvider::dataServiceConnected()
@@ -1190,7 +1555,9 @@ void HybrisProvider::connectionErrorReported(const QString &path, const QString 
     qCDebug(lcGeoclueHybris) << path << error;
 
     if (path.contains(QStringLiteral("cellular")))
-#if GEOCLUE_ANDROID_GPS_INTERFACE >= 1
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        m_agps->dataConnFailed();
+#elif GEOCLUE_ANDROID_GPS_INTERFACE >= 1
         m_agps->data_conn_failed();
 #else
         m_agps->data_conn_failed(AGPS_TYPE_SUPL);
@@ -1202,7 +1569,9 @@ void HybrisProvider::connectionSelected(bool selected)
     if (!selected) {
         qCDebug(lcGeoclueHybris) << "User aborted mobile data connection";
 
-#if GEOCLUE_ANDROID_GPS_INTERFACE >= 1
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        m_agps->dataConnFailed();
+#elif GEOCLUE_ANDROID_GPS_INTERFACE >= 1
         m_agps->data_conn_failed();
 #else
         m_agps->data_conn_failed(AGPS_TYPE_SUPL);
@@ -1274,7 +1643,11 @@ void HybrisProvider::stateChanged(const QString &state)
 {
     if (state == "online") {
         if (m_gpsStarted && m_useForcedXtraInject) {
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+            gnssXtraDownloadRequest();
+#else
             gpsXtraDownloadRequest();
+#endif
         }
     }
 }
@@ -1312,7 +1685,9 @@ void HybrisProvider::connectionContextValidChanged()
         m_connectionContext->deleteLater();
         m_connectionContext = 0;
 
-#if GEOCLUE_ANDROID_GPS_INTERFACE >= 2
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        m_agps->dataConnOpen(apn.constData(), fromContextProtocol(protocol));
+#elif GEOCLUE_ANDROID_GPS_INTERFACE >= 2
         if (m_agps->data_conn_open_with_apn_ip_type)
             m_agps->data_conn_open_with_apn_ip_type(apn.constData(), fromContextProtocol(protocol));
         else
@@ -1398,12 +1773,21 @@ void HybrisProvider::startPositioningIfNeeded()
                          this, SLOT(injectPosition(int,int,double,double,double,Accuracy)));
     }
 
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+    bool error = m_gps->setPositionMode(m_agpsEnabled ? GNSS_POSITION_MODE_MS_BASED
+                                                      : GNSS_POSITION_MODE_STANDALONE,
+                                        GNSS_POSITION_RECURRENCE_PERIODIC,
+                                        minimumRequestedUpdateInterval(),
+                                        PreferredAccuracy, PreferredInitialFixTime);
+    if (!error) {
+#else
     int error = m_gps->set_position_mode(m_agpsEnabled ? GPS_POSITION_MODE_MS_BASED
                                                        : GPS_POSITION_MODE_STANDALONE,
                                          GPS_POSITION_RECURRENCE_PERIODIC,
                                          minimumRequestedUpdateInterval(),
                                          PreferredAccuracy, PreferredInitialFixTime);
     if (error) {
+#endif
         qWarning("Failed to set position mode, error %d\n", error);
         setStatus(StatusError);
         return;
@@ -1412,7 +1796,11 @@ void HybrisProvider::startPositioningIfNeeded()
     qCDebug(lcGeoclueHybris) << "Starting positioning";
 
     error = m_gps->start();
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+    if (!error) {
+#else
     if (error) {
+#endif
         qWarning("Failed to start positioning, error %d\n", error);
         setStatus(StatusError);
         return;
@@ -1421,7 +1809,11 @@ void HybrisProvider::startPositioningIfNeeded()
     m_gpsStarted = true;
 
     if (m_useForcedXtraInject && m_networkManager->state() == "online") {
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        gnssXtraDownloadRequest();
+#else
         gpsXtraDownloadRequest();
+#endif
     }
 }
 
@@ -1447,8 +1839,13 @@ void HybrisProvider::stopPositioningIfNeeded()
 
     if (m_gps) {
         qCDebug(lcGeoclueHybris) << "Stopping positioning";
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        bool error = m_gps->stop();
+        if (!error)
+#else
         int error = m_gps->stop();
         if (error)
+#endif
             qWarning("Failed to stop positioning, error %d\n", error);
         m_gpsStarted = false;
         setStatus(StatusUnavailable);
@@ -1514,7 +1911,9 @@ void HybrisProvider::startDataConnection()
 
     if (!m_agpsOnlineEnabled) {
         qCDebug(lcGeoclueHybris) << "Online aGPS not enabled, not starting data connection.";
-#if GEOCLUE_ANDROID_GPS_INTERFACE >= 1
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        m_agps->dataConnFailed();
+#elif GEOCLUE_ANDROID_GPS_INTERFACE >= 1
         m_agps->data_conn_failed();
 #else
         m_agps->data_conn_failed(AGPS_TYPE_SUPL);
@@ -1606,7 +2005,9 @@ void HybrisProvider::processNextConnectionContext()
         delete m_connectionContext;
         m_connectionContext = 0;
 
-#if GEOCLUE_ANDROID_GPS_INTERFACE >= 1
+#if GEOCLUE_ANDROID_GPS_INTERFACE >= 4
+        m_agps->dataConnFailed();
+#elif GEOCLUE_ANDROID_GPS_INTERFACE >= 1
         m_agps->data_conn_failed();
 #else
         m_agps->data_conn_failed(AGPS_TYPE_SUPL);
