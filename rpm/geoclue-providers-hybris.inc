@@ -1,4 +1,3 @@
-Name: geoclue-provider-hybris
 Version: 0.0.1
 Release: 1
 Summary: Geoinformation Service Hybris Provider
